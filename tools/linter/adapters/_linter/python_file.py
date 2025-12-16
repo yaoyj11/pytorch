@@ -30,13 +30,18 @@ class PythonFile:
     ) -> None:
         self.linter_name = linter_name
         self._contents = contents
-        self.path = path.relative_to(ROOT) if path and path.is_absolute() else path
+        self._path = path.relative_to(ROOT) if path and path.is_absolute() else path
+
+    @cached_property
+    def path(self) -> Path:
+        assert self._path is not None
+        return Path(self._path)
 
     @cached_property
     def contents(self) -> str:
         if self._contents is not None:
             return self._contents
-        return self.path.read_text() if self.path else ""
+        return self.path.read_text() if self._path else ""
 
     @cached_property
     def lines(self) -> list[str]:
@@ -157,6 +162,16 @@ class PythonFile:
         from .blocks import blocks
 
         return blocks(self)
+
+    @cached_property
+    def blocks_by_line_number(self) -> dict[int, Block]:
+        # Lines that don't appear are in the top-level scope
+        # Later blocks correctly overwrite earlier, parent blocks.
+        return {i: b for b in self.blocks for i in b.line_range}
+
+    def block_name(self, line: int) -> str:
+        block = self.blocks_by_line_number.get(line)
+        return block.full_name if block else ""
 
 
 class OmittedLines:
