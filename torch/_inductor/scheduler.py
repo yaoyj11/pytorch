@@ -15,6 +15,7 @@ import textwrap
 import traceback
 import typing
 from collections import Counter, defaultdict
+from concurrent.futures import as_completed
 from typing import Any, Generic, Optional, TYPE_CHECKING, TypeAlias, TypeVar, Union
 from typing_extensions import ParamSpec
 
@@ -2809,6 +2810,9 @@ class Scheduler:
         # in codegen we only use buf0, never buf1
         self.mutation_renames: dict[str, str] = {}
 
+        self.seen_template_fusions: OrderedSet[
+            tuple[BaseSchedulerNode, BaseSchedulerNode]
+        ] = OrderedSet()
         # Must run first to correctly set dependencies, before all other passes that rely on
         # reading from .read_writes.reads or .unmet_dependencies
         self.nodes = comms.decide_global_ordering_of_comms(
@@ -3623,7 +3627,7 @@ class Scheduler:
         device = nodes[0].get_device()
         self.current_device = device
         backend = self.get_backend(device)
-        with dynamo_timed("benchmark_fused_nodes"):
+        with dynamo_timed("generate_kernel_code_from_nodes"):
             return backend.generate_kernel_code_from_nodes(
                 nodes, benchmark_kernel, hint_override=hint_override
             )
@@ -3637,7 +3641,7 @@ class Scheduler:
         """
         self.current_device = device
         backend = self.get_backend(device)
-        with dynamo_timed("benchmark_fused_nodes"):
+        with dynamo_timed("benchmark_codegened_module"):
             return backend.benchmark_codegened_module(module)
 
     def finalize_multi_template_buffers(self) -> None:
@@ -3757,7 +3761,7 @@ class Scheduler:
 
     def speedup_by_fusion(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
-    ) -> Union[bool, Callable[[], bool]]:
+    ) -> Union[bool, tuple[Callable[[], bool], list[Optional[LambdaFuture]]]]:
         """
         If config.benchmark_fusion is False, always return True.
         Otherwise, return True if fusion can brings speedup.
@@ -3992,7 +3996,7 @@ class Scheduler:
                 else:
                     return False
 
-            return benchmark_when_ready
+            return benchmark_when_ready, future_choices[0][1]
 
         else:
             # Start parallel compilation for all three kernels
@@ -4072,7 +4076,7 @@ class Scheduler:
                         return True
                     raise
 
-            return benchmark_when_ready
+            return benchmark_when_ready, future_and_mod_l1_fused[0][1]
 
     def get_fused_node(self, node: BaseSchedulerNode) -> BaseSchedulerNode:
         "Look up the node in Scheduler name_to_fused_node"
@@ -4099,9 +4103,17 @@ class Scheduler:
 
         # These are potential fusions which we are async compiling,
         # and which we will benchmark profitability of.
+        # Maps node -> (is_speedup_fn, LambdaFuture, node1, node2)
         pending_fusions: dict[
             BaseSchedulerNode,
-            tuple[Callable[[], bool], BaseSchedulerNode, BaseSchedulerNode],
+            list[
+                tuple[
+                    Callable[[], bool],
+                    list[Optional[LambdaFuture]],
+                    BaseSchedulerNode,
+                    BaseSchedulerNode,
+                ]
+            ],
         ] = {}
 
         def fuse_two_nodes(
@@ -4120,9 +4132,38 @@ class Scheduler:
             )
             return node3
 
+        def is_epilogue_fusion(node1: BaseSchedulerNode, node2: BaseSchedulerNode):
+            return (
+                node1.is_template()
+                and config.epilogue_fusion
+                and not node2.is_template()
+            )
+
+        def is_prologue_fusion(node1: BaseSchedulerNode, node2: BaseSchedulerNode):
+            return (
+                node2.is_template()
+                and config.prologue_fusion
+                and not node1.is_template()
+            )
+
+        def is_template_fusion(node1: BaseSchedulerNode, node2: BaseSchedulerNode):
+            return is_epilogue_fusion(node1, node2) or is_prologue_fusion(node1, node2)
+
         def resolve_pending_fusions(
             node1: BaseSchedulerNode, node2: BaseSchedulerNode
         ) -> None:
+            if is_template_fusion(node1, node2):
+                # For template fusions, the template node should not be in pending_fusions
+                template_node = node1 if is_epilogue_fusion(node1, node2) else node2
+                other_node = node2 if is_epilogue_fusion(node1, node2) else node1
+                assert self.get_fused_node(template_node) not in pending_fusions
+                if self.get_fused_node(other_node) in pending_fusions:
+                    # Lazily eval fusions with many potential template fusions
+                    pending_fusion = pending_fusions[self.get_fused_node(other_node)]
+                    _, future, _, _ = pending_fusion[0]
+                    if pending_fusion and future:
+                        return
+
             while (
                 self.get_fused_node(node1) in pending_fusions
                 or self.get_fused_node(node2) in pending_fusions
@@ -4131,9 +4172,12 @@ class Scheduler:
                     self.get_fused_node(node1),
                     pending_fusions.get(self.get_fused_node(node2), None),
                 )
-                assert pending_fusion is not None
+                assert pending_fusion is not None and len(pending_fusion) == 1
 
-                is_speedup, node_key1, node_key2 = pending_fusion
+                fusion_log.error(
+                    f"Evaluating {node1.get_name()} {node2.get_name()} in pending_fusions"
+                )
+                is_speedup, _, node_key1, node_key2 = pending_fusion[0]
                 pending_fusions.pop(node_key1, None)
                 pending_fusions.pop(node_key2, None)
 
@@ -4145,6 +4189,15 @@ class Scheduler:
 
                 fuse_two_nodes(node_key1, node_key2)
 
+        # We want to lazily evalute template fusions, as a given epilogue/prologue node can be a candidate
+        # for fusion with multiple templates. If pending fusions are always evaluated when there is a new
+        # fusion being evaluated for a node in a pending fusion, there is a large amount of time in
+        # waiting for compilation. By lazily awaiting it, compilation is parallelized, while
+        # maintaining the original order.
+        # We separate epilogue and prologue fusions to prioritize epilogues (generally higher gain).
+
+        epilogue_fusion_nodes: OrderedSet[BaseSchedulerNode] = OrderedSet()
+        prologue_fusion_nodes: OrderedSet[BaseSchedulerNode] = OrderedSet()
         for node1, node2 in self.get_possible_fusions(nodes, is_reorder_round):
             # if either node is in a pending fusion, resolve it.
             # since we iterate on potential fusions based on profitability
@@ -4152,14 +4205,48 @@ class Scheduler:
             resolve_pending_fusions(node1, node2)
             node1 = self.get_fused_node(node1)
             node2 = self.get_fused_node(node2)
+            if (
+                is_template_fusion(node1, node2)
+                and (node1, node2) in self.seen_template_fusions
+            ):
+                continue
 
             if self.can_fuse(
                 node1, node2, is_reorder_round
             ) and not self.will_fusion_create_cycle(node1, node2):
                 speedup = self.speedup_by_fusion(node1, node2)
-                if callable(speedup):
-                    pending_fusions[node1] = (speedup, node1, node2)
-                    pending_fusions[node2] = (speedup, node1, node2)
+                if isinstance(speedup, tuple):
+                    assert len(speedup) == 2
+                    assert is_template_fusion(node1, node2)
+                    epilogue_fusion = is_epilogue_fusion(node1, node2)
+
+                    # Update seen template fusions cache
+                    assert (node1, node2) not in self.seen_template_fusions
+                    self.seen_template_fusions.add((node1, node2))
+                    fusion_log.debug(
+                        f"Template fusion attempted: {node1.get_name()} -> {node2.get_name()}"
+                    )
+
+                    fusion_log.debug(
+                        f"Adding {node1.get_name()} {node2.get_name()} to pending_fusions"
+                    )
+                    is_speedup_fn, future = speedup
+                    if node1 not in pending_fusions:
+                        pending_fusions[node1] = []
+
+                    if node2 not in pending_fusions:
+                        pending_fusions[node2] = []
+
+                    pending_fusions[node1].append((is_speedup_fn, future, node1, node2))
+                    pending_fusions[node2].append((is_speedup_fn, future, node1, node2))
+
+                    # Track epilogue and prologue fusion candidates separately
+                    other_node = node2 if epilogue_fusion else node1
+                    if epilogue_fusion:
+                        epilogue_fusion_nodes.add(other_node)
+                    else:
+                        prologue_fusion_nodes.add(other_node)
+
                     continue
 
                 if not speedup:
@@ -4167,20 +4254,64 @@ class Scheduler:
 
                 fuse_two_nodes(node1, node2)
 
+        def evaluate_pending_template_fusions(
+            fusion_nodes: OrderedSet[BaseSchedulerNode],
+            seen_pair_speedup_fn: OrderedSet[Callable[[], bool]],
+            fusion_type: str,
+        ) -> None:
+            """
+            Evaluate pending template fusions for a set of fusion candidate nodes.
+            fusion_type is either "epilogue" or "prologue" for logging purposes.
+            """
+            finished_fusions: OrderedSet[BaseSchedulerNode] = OrderedSet()
+            while len(fusion_nodes) > len(finished_fusions):
+                template_futures = []
+                future_to_pending_fusion = {}
+
+                remaining_nodes = fusion_nodes - finished_fusions
+                for fusion_node in remaining_nodes:
+                    if fusion_node not in pending_fusions:
+                        finished_fusions.add(fusion_node)
+                        continue
+                    assert len(pending_fusions[fusion_node]) >= 1
+                    speedup_fn, future, node1, node2 = pending_fusions[fusion_node].pop(0)
+                    if speedup_fn in seen_pair_speedup_fn:
+                        continue
+                    fusion_log.debug(
+                        f"Evaluating {fusion_type} fusion node {fusion_node.get_name()}"
+                    )
+                    seen_pair_speedup_fn.add(speedup_fn)
+
+                    if len(pending_fusions[fusion_node]) == 0:
+                        del pending_fusions[fusion_node]
+                        finished_fusions.add(fusion_node)
+
+                    f = future.future
+                    template_futures.append(f)
+                    future_to_pending_fusion[f] = (speedup_fn, future, node1, node2)
+
+                for f in as_completed(template_futures):
+                    speedup_fn, _, node1, node2 = future_to_pending_fusion[f]
+
+                    if speedup_fn() and not self.will_fusion_create_cycle(node1, node2):
+                        fuse_two_nodes(node1, node2)
+                        # Determine the non-template node based on fusion type
+                        non_template_node = (
+                            node2 if is_epilogue_fusion(node1, node2) else node1
+                        )
+                        if non_template_node in pending_fusions:
+                            del pending_fusions[non_template_node]
+                        finished_fusions.add(non_template_node)
+
+        # Evaluate epilogue fusions first (generally higher priority/more gain),
+        # then prologue fusions
         seen_pair_speedup_fn: OrderedSet[Callable[[], bool]] = OrderedSet()
-        for is_speedup_fn, node_key1, node_key2 in pending_fusions.values():
-            if is_speedup_fn in seen_pair_speedup_fn:
-                continue
-
-            seen_pair_speedup_fn.add(is_speedup_fn)
-
-            assert self.get_fused_node(node_key1) is node_key1
-            assert self.get_fused_node(node_key2) is node_key2
-
-            if is_speedup_fn() and not self.will_fusion_create_cycle(
-                node_key1, node_key2
-            ):
-                fuse_two_nodes(node_key1, node_key2)
+        evaluate_pending_template_fusions(
+            epilogue_fusion_nodes, seen_pair_speedup_fn, "epilogue"
+        )
+        evaluate_pending_template_fusions(
+            prologue_fusion_nodes, seen_pair_speedup_fn, "prologue"
+        )
 
         nodes = sorted(fused_nodes, key=lambda x: x.min_order)
         nodes = self.topological_sort_schedule(nodes)
