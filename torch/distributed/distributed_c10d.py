@@ -141,6 +141,14 @@ _GLOO_AVAILABLE = True
 _UCC_AVAILABLE = True
 _XCCL_AVAILABLE = True
 
+try:
+    # pyrefly: ignore [missing-import]
+    from torchcomms._comms import _BackendWrapper, new_comm
+
+    _TORCHCOMM_AVAILABLE = True
+except ImportError:
+    _TORCHCOMM_AVAILABLE = False
+
 _pickler = pickle.Pickler
 _unpickler = pickle.Unpickler
 
@@ -1588,6 +1596,7 @@ def init_process_group(
     pg_options: Any | None = None,
     device_id: torch.device | int | None = None,
     _ranks: list[int] | None = None,
+    _use_torchcomm: bool = False,
 ) -> None:
     """
     Initialize the default distributed process group.
@@ -1664,6 +1673,7 @@ def init_process_group(
             type at compile time will be used.
         _ranks: The ranks in the process group. If provided, the process
                group name will be the hash of all the ranks in the group.
+        _use_torchcomm: Whether to use torch.distributed._torchcomm for communication backend.
 
     .. note:: To enable ``backend == Backend.MPI``, PyTorch needs to be built from source
         on a system that supports MPI.
@@ -1821,6 +1831,7 @@ def init_process_group(
             timeout=timeout,
             device_id=device_id,
             group_desc="default_pg",
+            _use_torchcomm=_use_torchcomm,
         )
 
     _update_default_pg(default_pg)
@@ -1908,6 +1919,7 @@ def _new_process_group_helper(
     pg_tag=None,
     device_id=None,
     group_desc=None,
+    _use_torchcomm=False,
 ):
     """
     Create a new distributed process group.
@@ -2034,6 +2046,17 @@ def _new_process_group_helper(
                     backend_class.size(),
                 )
                 pg._set_default_backend(backend_type)
+        elif _use_torchcomm:
+            if not _TORCHCOMM_AVAILABLE:
+                raise RuntimeError(
+                    "torchcomms is not available. Please install torchcomms to use this feature."
+                )
+            device = torch.device(os.environ.get("TORCHCOMM_DEVICE", "cuda"))
+            # TODO: We need to add pg option conversion.
+            comm = new_comm(backend_str, device, name=group_name)
+            group_name = GroupName(group_name)
+            backend_class = _BackendWrapper(comm)
+            backend_type = ProcessGroup.BackendType.CUSTOM
         elif backend_str == Backend.GLOO:
             # TODO: remove this check after lazy initialization is supported
             # if pg_options is not None:
@@ -5140,6 +5163,7 @@ def split_group(
     timeout: timedelta | None = None,
     pg_options: Any | None = None,
     group_desc: str | None = None,
+    _use_torchcomm: bool = False,
 ) -> ProcessGroup | None:
     """
     Create a new process group split from the given parent process group.
@@ -5302,6 +5326,7 @@ def new_group(
     use_local_synchronization: bool = False,
     group_desc=None,
     device_id: torch.device | None = None,
+    _use_torchcomm: bool = False,
 ):
     """
     Create a new distributed group.
@@ -5380,6 +5405,7 @@ def new_group(
         use_local_synchronization=use_local_synchronization,
         group_desc=group_desc,
         device_id=device_id,
+        _use_torchcomm=_use_torchcomm,
     )
 
 
@@ -5392,6 +5418,7 @@ def _new_group_with_tag(
     use_local_synchronization=False,
     group_desc=None,
     device_id: torch.device | None = None,
+    _use_torchcomm: bool = False,
 ):
     """
     Variant of ``new_group`` that exposes tag creation.
@@ -5474,6 +5501,7 @@ def _new_group_with_tag(
         pg_tag=pg_tag,
         device_id=device_id,
         group_desc=group_desc,
+        _use_torchcomm=_use_torchcomm,
     )
 
     # Create the global rank to group rank mapping
