@@ -3706,10 +3706,14 @@ def run_node(
     with set_current_node(node):
 
         def make_error_message(e: Any) -> str:
-            return (
+            err_msg = (
                 f"Dynamo failed to run FX node with fake tensors: {op} {node.target}(*{args}, **{kwargs}): got "
                 + repr(e)
             )
+            if getattr(node, "stack_trace", False):
+                err_msg += "\nFX node stack trace:\n" + node.stack_trace
+
+            return err_msg
 
         from .exc import Unsupported
 
